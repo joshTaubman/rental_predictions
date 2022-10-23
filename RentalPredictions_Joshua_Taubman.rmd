@@ -1,0 +1,348 @@
+---
+title: "RentalPredictions_Joshua_Taubman"
+output:
+  pdf_document: default
+  html_document: default
+date: "2022-10-23"
+---
+
+In this project we will be predicting rental prices for residences across India.
+
+Data set reference: Banerjee, Sourav. "House Rent Prediction Dataset", *Kaggle,* Accessed: 23/10/2022*.*
+
+**Move the attached CSV file into the default directory for your Rstudio**
+
+```{r}
+dat<- read.csv("House_Rent_Dataset.csv")
+```
+
+Create Training and Test Sets
+
+```{r}
+library(caret)
+library(tidyverse)
+test_indexes <- createDataPartition(y = dat$Rent,times = 1, 0.1, list = FALSE)
+test_data <- dat[test_indexes,]
+train_data <- dat[-test_indexes,]
+```
+
+RMSE function
+
+```{r}
+
+rmse<- function(prediction, true){
+  sqrt(mean(prediction-true)^2)
+  }
+
+```
+
+Add average across all rent for most basic predictor.
+
+```{mu <- mean(train_data$Rent)}
+```
+
+**Property size brackets as predictor**
+
+To use property size as a predictor along with other things we need to transform it into a bias, which can be done by partitioning our property size into brackets.
+
+We take the lower bound of each bracket.
+
+```{r}
+hist(train_data$Size, breaks = 20)
+level_lower_bound <- cut(train_data$Size, breaks = seq(0,8100,100),
+                        labels = sapply(seq(0,8000,100), toString))
+df_l <- data.frame(level_lower_bound)
+colnames(df_l) <- "level_lwer_bound"
+train_data <- train_data %>% cbind(df_l, .)
+```
+
+Replicate process but this time for test data
+
+```{r}
+
+level_lower_bound_test <- cut(test_data$Size, breaks = seq(0,8100,100),
+                              labels = sapply(seq(0,8000,100), toString))
+df_l_t <- data.frame(level_lower_bound_test)
+colnames(df_l_t) <- "level_lwer_bound"
+test_data <- test_data %>% cbind(df_l_t, .)
+```
+
+Bind on this new classification of property size bracket
+
+```{r}
+mu <- mean(train_data$Rent)
+level_averages <- train_data %>%
+  group_by(level_lwer_bound) %>%
+  summarise(level_avg = mean(Rent-mu))
+
+
+train_data <- train_data %>%
+  left_join(level_averages, by = "level_lwer_bound") 
+
+test_data <- test_data %>% 
+  left_join(level_averages, by = "level_lwer_bound") 
+```
+
+We have a naive linear fit just based upon property size. We will use this as a bench mark and also to fill in NAs within our data.
+
+```{r}
+linear_fit <- lm(Rent~ Size, data = train_data)
+y_hat_lm <- predict(linear_fit, newdata = test_data)
+```
+
+Replacing NAs and predicting with size brackets.
+
+```{r}
+for (i in 1:length(test_data$level_avg)) {
+  test_data$level_avg[i] <- ifelse(is.na(test_data$level_avg[i] == TRUE),
+         (predict(linear_fit, newdata = test_data))[i]
+         ,test_data$level_avg[i])
+}
+
+y_hat_size_strata <- mu + test_data$level_avg 
+```
+
+Result RMSEs
+
+```{r}
+linear_model<- rmse(y_hat_lm, test_data$Rent)
+size_strata <- rmse(y_hat_size_strata, test_data$Rent)
+
+
+rmse_results <- data.frame(method = "Linear Regression on Size", 
+                           RMSE = linear_model)
+
+rmse_results <- bind_rows(rmse_results,
+                          data.frame(method= "Property Size Brackets",
+                                     RMSE = size_strata))
+rmse_results %>% knitr::kable()
+```
+
+**City Averages as a Predictor**
+
+Add in averages across each city listed then add these as an additional bias.
+
+```{r}
+city_averages <- train_data %>%
+  group_by(City) %>%
+  summarise(city_avgs = mean(Rent - level_avg- mu))
+  
+
+city_averages %>%
+  ggplot(aes(City,city_avgs))+
+  geom_point()
+
+train_data <- train_data %>%
+  left_join(city_averages, by ="City")
+
+#Model taking into account biases of city and size strata
+test_data <- test_data %>% 
+  left_join(city_averages, by = "City")
+
+y_hat_3 <- mu + test_data$city_avgs + test_data$level_avg
+strat_cit <- rmse(y_hat_3, test_data$Rent)
+
+rmse_results <- bind_rows(rmse_results,
+                          data.frame(method= "Size Bracket and City",
+                                     RMSE = strat_cit))
+
+rmse_results %>% knitr::kable()
+
+```
+
+**Finding Optimal Lambda for Regularisation**
+
+```{r}
+lambdas <- seq(0, 10^4, 50)
+rmses <- sapply(lambdas, function(l){
+  mu <- mean(train_data$Rent)
+  level_average_reg <- train_data %>%
+#Can't use group by either
+    group_by(level_lwer_bound) %>%
+    summarize(level_avg_reg = sum(Rent - mu)/(n()+l))
+
+#left join will be problematic
+#can't left join on a list but what exactly does this bug mean?
+
+#colnames(level_average_reg) <- level_avg_reg 
+  city_average_reg <- train_data %>% 
+    group_by(level_lwer_bound) %>%
+    left_join(level_average_reg, by = "level_lwer_bound") %>%
+    ungroup() %>%
+    group_by(City) %>%
+    summarize(city_avg_reg = sum(Rent - level_avg_reg - mu)/(n()+l))
+  predicted_rent <- 
+    test_data %>% 
+    group_by(level_lwer_bound) %>%
+    left_join(level_average_reg, by = "level_lwer_bound") %>%
+    ungroup() %>%
+    group_by(City)%>%
+    left_join(city_average_reg, by = "City") %>%
+    mutate(pred = mu + level_avg_reg + city_avg_reg) %>%
+    .$pred
+  
+  #Replace the few NAs with linear fit
+  for (i in 1:length(predicted_rent)) {
+    predicted_rent[i] <- ifelse(is.na(predicted_rent[i] == TRUE |
+                                      predicted_rent[i] <= 0),
+                                (predict(linear_fit, newdata = test_data))[i]
+                                ,predicted_rent[i])
+  }
+  return(rmse(predicted_rent, test_data$Rent))
+})
+rmses
+qplot(lambdas, rmses)  
+ind<- which.min(rmses)
+lambda_best <- (ind-1) *50
+lambda_best
+```
+
+Update RMSE table with optimal regularisation factor
+
+```{r}
+rmse_results <- bind_rows(rmse_results,
+                          data.frame(method= paste("Regularisation, lambda =", 
+                                     lambda_best),
+                                     RMSE = rmses[ind]))
+rmse_results %>% knitr::kable()
+
+just_mu <- rmse(mu, test_data$Rent)
+
+rmse_results <- bind_rows(rmse_results,
+                          data.frame(method= "Just using average rent",
+                                     RMSE = just_mu))
+```
+
+**Bootstrapping**
+
+Due to the variability in RMSE based upon which seed is selected and each time the program is run, we bootstrap our train data to prevent over-fitting in our regularisation and to provide a more stable prediction of the test set.
+
+We recreate our predictors after resampling our data.
+
+```{r}
+indexes_boot <- createResample(train_data$Rent, 10)
+# indexes_boot
+#What we had was we were splitting the data based on columns not rows
+# length(train_data)
+#Test out bootstrapping, just calculating mu
+
+mu_boot <- sapply(indexes_boot, function(ind){
+  rent_boot<- train_data$Rent[ind]
+  mean(rent_boot)
+})
+# mu_boot
+# mean(mu_boot)
+# mean(mu_boot)-mu
+#Why are mu and mean(mu_boot) so different???
+# train_data$Rent
+# mu
+y_hat_mu_boot <- mean(mu_boot)
+rmse_mu_boot <- rmse(y_hat_mu_boot, test_data$Rent)
+# rmse_mu_boot
+
+rmse_results <- bind_rows(rmse_results,
+                          data.frame(method= "Bootstrap using just Mu",
+                                     RMSE = rmse_mu_boot))
+
+rmse_results %>% knitr::kable()
+
+levels_boot <- sapply(indexes_boot, function(ind){
+  level_boot<- train_data$level_avg[ind]
+  rent_l_boot <- mu - level_boot
+  mean(rent_l_boot)
+})
+y_hat_mu_l_boot <- mean(levels_boot)
+rmse_mu_l_boot <- rmse(y_hat_mu_l_boot, test_data$Rent)
+
+rmse_results <- bind_rows(rmse_results,
+                          data.frame(method= "Bootstrap with Size Level",
+                                     RMSE = rmse_mu_l_boot))
+
+rmse_results %>% knitr::kable()
+
+# #Now we do the same for regularisation
+# #We will need to still take a value for Mu (do we select the median?)
+# rmses
+# #Resampled indexes
+# indexes_boot
+
+```
+
+When finding the optimal regularisation coefficient we need to use an sapply/for loop to step through all of the different sampling possiblities. We need to take row means of our results to average over each bootstrap. Limited the range of this lambda max size for computational time reasons.
+
+```{r}
+######## rmse function using the relevant lambdas
+#lambdas only go up to 10^3 to reduce run time
+lambdas<- seq(0, 10^3, 50)
+rmse_boot<- sapply(indexes_boot, function(ind){
+    sapply(lambdas, function(l){
+  mu <- mean(train_data$Rent[ind])
+  #To select the rows based upon index we need to turn our train and test data
+  # into data frames
+  train_df <- train_data %>% data.frame(.)
+  test_df <- test_data %>% data.frame(.)
+  train_df_boot <- train_df[ind,]
+  test_df_boot <- test_df[-ind,]
+  
+  level_average_reg <- train_df_boot %>%
+    #Can't use group by either
+    group_by(level_lwer_bound) %>%
+    summarize(level_avg_reg = sum(Rent - mu)/(n()+l))
+  
+  #left join will be problematic
+  #can't left join on a list but what exactly does this bug mean?
+  
+  #colnames(level_average_reg) <- level_avg_reg 
+  city_average_reg <- train_df_boot %>% 
+    group_by(level_lwer_bound) %>%
+    left_join(level_average_reg, by = "level_lwer_bound") %>%
+    ungroup() %>%
+    group_by(City) %>%
+    summarize(city_avg_reg = sum(Rent - level_avg_reg - mu)/(n()+l))
+  predicted_rent <- 
+    test_df_boot %>% 
+    group_by(level_lwer_bound) %>%
+    left_join(level_average_reg, by = "level_lwer_bound") %>%
+    ungroup() %>%
+    group_by(City)%>%
+    left_join(city_average_reg, by = "City") %>%
+    mutate(pred = mu + level_avg_reg + city_avg_reg) %>%
+    .$pred
+  
+  #Replace the few NAs with linear fit
+  for (i in 1:length(predicted_rent)) {
+    predicted_rent[i] <- ifelse(is.na(predicted_rent[i] == TRUE |
+                                        predicted_rent[i] <= 0),
+                                (predict(linear_fit, newdata = test_data))[i]
+                                ,predicted_rent[i])
+  }
+  #predicted_rent_avg<- mean(predicted_rent)
+  #print(predicted_rent)
+  predicted_rent_avg<- mean(predicted_rent)
+  return(rmse(predicted_rent_avg, test_data$Rent))
+})
+})
+
+
+rmse_boot_mat<- as.matrix(rmse_boot)
+average_accross_boots <- rowMeans(rmse_boot_mat)
+average_accross_boots
+
+ind_b<- which.min(average_accross_boots)
+ind_b
+lambda_best_b <- (ind_b-1) *50
+lambda_best_b
+
+rmse_results <- bind_rows(rmse_results,
+                          data.frame(method= paste("Reg with Boot, lambda =", 
+                                                   lambda_best_b),
+                                     RMSE = average_accross_boots[ind_b]))
+rmse_results %>% knitr::kable()
+```
+
+Here are the final RMSE results
+
+```{r}
+rmse_results
+
+```
